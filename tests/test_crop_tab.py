@@ -282,3 +282,72 @@ def test_main_raises_the_image_allocation_limit():
     would exceed 256MB by default, which real photos/scans routinely do."""
     src = inspect.getsource(app.main)
     assert "QImageReader.setAllocationLimit" in src
+
+
+# -- existing-target confirmation (postfix mode) -----------------------------
+
+
+def test_save_asks_before_overwriting_an_existing_postfix_target(
+    qapp, jpegtran_path, command_log, session_state, sample_jpeg
+):
+    tab = make_crop_tab(jpegtran_path, command_log, session_state)
+    tab.load_file([sample_jpeg])
+    tab.crop_view._crop = QRect(0, 0, 96, 80)
+    tab.crop_view.selectionChanged.emit(tab.crop_view._crop)
+
+    target = sample_jpeg.with_name("sample_crop.jpg")
+    target.write_bytes(b"pre-existing, unrelated content")
+    target_mtime = target.stat().st_mtime_ns
+
+    with patch.object(app, "confirm_existing_target", return_value=("skip", False)) as mock_confirm:
+        tab.save_crop()
+        assert mock_confirm.called, "must ask before silently overwriting an existing target"
+
+    assert target.stat().st_mtime_ns == target_mtime, "target must be untouched after Skip"
+    assert "Skipped" in tab.status_label.text()
+
+
+def test_save_overwrite_choice_proceeds_normally(qapp, jpegtran_path, command_log, session_state, sample_jpeg):
+    tab = make_crop_tab(jpegtran_path, command_log, session_state)
+    tab.load_file([sample_jpeg])
+    tab.crop_view._crop = QRect(0, 0, 96, 80)
+    tab.crop_view.selectionChanged.emit(tab.crop_view._crop)
+
+    target = sample_jpeg.with_name("sample_crop.jpg")
+    target.write_bytes(b"pre-existing, unrelated content")
+
+    with patch.object(app, "confirm_existing_target", return_value=("overwrite", False)) as mock_confirm:
+        tab.save_crop()
+        assert mock_confirm.called
+
+    img = QImage(str(target))
+    assert (img.width(), img.height()) == (96, 80), "target should now hold the actual crop"
+
+
+def test_save_with_no_existing_target_does_not_prompt(qapp, jpegtran_path, command_log, session_state, sample_jpeg):
+    tab = make_crop_tab(jpegtran_path, command_log, session_state)
+    tab.load_file([sample_jpeg])
+    tab.crop_view._crop = QRect(0, 0, 96, 80)
+    tab.crop_view.selectionChanged.emit(tab.crop_view._crop)
+
+    assert not sample_jpeg.with_name("sample_crop.jpg").exists()
+    with patch.object(app, "confirm_existing_target") as mock_confirm:
+        tab.save_crop()
+        assert not mock_confirm.called
+
+
+def test_in_place_mode_does_not_use_the_existing_target_prompt(
+    qapp, jpegtran_path, command_log, session_state, sample_jpeg
+):
+    """In-place mode already has its own overwrite confirmation (confirm_overwrite) -
+    it must not also trigger the postfix-target-exists dialog."""
+    tab = make_crop_tab(jpegtran_path, command_log, session_state)
+    tab.load_file([sample_jpeg])
+    tab.crop_view._crop = QRect(0, 0, 96, 80)
+    tab.crop_view.selectionChanged.emit(tab.crop_view._crop)
+    tab.save_mode.inplace_radio.setChecked(True)
+    session_state.skip_overwrite_confirm = True
+
+    with patch.object(app, "confirm_existing_target") as mock_confirm:
+        tab.save_crop()
+        assert not mock_confirm.called

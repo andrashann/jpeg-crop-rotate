@@ -184,10 +184,13 @@ def confirm_overwrite(parent: QWidget, session_state: SessionState, message: str
     return proceed
 
 
-def confirm_existing_target(parent: QWidget, target_path: Path) -> tuple[str, bool]:
-    """Ask what to do when a batch output file already exists.
+def confirm_existing_target(parent: QWidget, target_path: Path, allow_apply_to_all: bool = True) -> tuple[str, bool]:
+    """Ask what to do when a save target (postfix output, not the original)
+    already exists.
 
     Returns (action, apply_to_all) where action is "skip" or "overwrite".
+    apply_to_all is always False when allow_apply_to_all is False (there's
+    nothing to apply it to for a lone single-file save).
     """
     box = QMessageBox(parent)
     box.setIcon(QMessageBox.Icon.Warning)
@@ -196,12 +199,14 @@ def confirm_existing_target(parent: QWidget, target_path: Path) -> tuple[str, bo
     skip_button = box.addButton("Skip", QMessageBox.ButtonRole.RejectRole)
     overwrite_button = box.addButton("Overwrite", QMessageBox.ButtonRole.DestructiveRole)
     box.setDefaultButton(skip_button)
-    checkbox = QCheckBox("Apply to all remaining files in this batch")
-    box.setCheckBox(checkbox)
+    checkbox = None
+    if allow_apply_to_all:
+        checkbox = QCheckBox("Apply to all remaining files in this batch")
+        box.setCheckBox(checkbox)
 
     box.exec()
     action = "overwrite" if box.clickedButton() is overwrite_button else "skip"
-    return action, checkbox.isChecked()
+    return action, bool(checkbox and checkbox.isChecked())
 
 
 # --------------------------------------------------------------------------
@@ -1293,6 +1298,13 @@ class CropTab(QWidget):
                 return
 
         final_outfile = self.save_mode.output_path_for(self.current_file)
+
+        if not self.save_mode.is_inplace() and final_outfile.exists():
+            action, _ = confirm_existing_target(self, final_outfile, allow_apply_to_all=False)
+            if action != "overwrite":
+                self.status_label.setText(f"Skipped: {display_path(final_outfile)} already exists.")
+                return
+
         write_target = final_outfile
         tmp_path: Path | None = None
         if self.save_mode.is_inplace():
