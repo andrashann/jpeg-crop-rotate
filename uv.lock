@@ -34,7 +34,7 @@ wheels = [
 
 [[package]]
 name = "jpeg-crop-rotate"
-version = "0.2.3"
+version = "0.3.0"
 source = { virtual = "." }
 
 [package.dev-dependencies]

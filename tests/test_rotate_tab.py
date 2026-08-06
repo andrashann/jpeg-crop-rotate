@@ -7,6 +7,7 @@ from unittest.mock import patch
 from PyQt6.QtGui import QImage
 
 import app
+from conftest import synth_drop
 
 
 def make_rotate_tab(jpegtran_path, command_log, session_state):
@@ -124,6 +125,30 @@ def test_no_standalone_browse_button_dropzone_handles_it(qapp, jpegtran_path, co
     tab = make_rotate_tab(jpegtran_path, command_log, session_state)
     assert not hasattr(tab, "browse_button")
     assert tab.drop_zone.multi is True
+
+
+def test_dropping_files_directly_onto_the_list_works_like_the_drop_zone(
+    qapp, jpegtran_path, command_log, session_state, make_jpeg
+):
+    f1, f2 = make_jpeg(), make_jpeg()
+    tab = make_rotate_tab(jpegtran_path, command_log, session_state)
+    synth_drop(tab.file_table, [f1, f2])
+    assert tab.files == [f1, f2]
+    assert tab.file_table.rowCount() == 2
+
+
+def test_dropping_a_non_jpeg_onto_the_list_is_rejected_with_a_warning(
+    qapp, jpegtran_path, command_log, session_state, sample_jpeg, tmp_path
+):
+    not_a_jpeg = tmp_path / "notes.txt"
+    not_a_jpeg.write_text("hello")
+
+    tab = make_rotate_tab(jpegtran_path, command_log, session_state)
+    with patch.object(app.QMessageBox, "warning") as mock_warning:
+        synth_drop(tab.file_table, [not_a_jpeg, sample_jpeg])
+        assert mock_warning.called
+
+    assert tab.files == [sample_jpeg]
 
 
 # -- default target folder tracks the batch --------------------------------

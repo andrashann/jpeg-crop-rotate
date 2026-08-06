@@ -124,6 +124,19 @@ def is_jpeg(path: Path) -> bool:
     return path.suffix.lower() in JPEG_EXTENSIONS
 
 
+def filter_dropped_jpegs(parent: QWidget, paths: list[Path]) -> list[Path]:
+    """Keep only .jpg/.jpeg paths, warning about anything else that was
+    dropped. Shared by every drop target so they all behave identically."""
+    jpegs = [p for p in paths if is_jpeg(p)]
+    rejected = len(paths) - len(jpegs)
+    if rejected:
+        QMessageBox.warning(
+            parent, "Unsupported files",
+            f"Ignored {rejected} file(s) that aren't .jpg/.jpeg.",
+        )
+    return jpegs
+
+
 _HOME = str(Path.home())
 _HOME_PREFIX = _HOME + os.sep
 
@@ -361,15 +374,30 @@ class DropZone(QFrame):
         self._accept([Path(p) for p in paths])
 
     def _accept(self, paths: list[Path]) -> None:
-        jpegs = [p for p in paths if is_jpeg(p)]
-        rejected = len(paths) - len(jpegs)
+        jpegs = filter_dropped_jpegs(self, paths)
         if jpegs:
             self.filesDropped.emit(jpegs)
-        if rejected:
-            QMessageBox.warning(
-                self, "Unsupported files",
-                f"Ignored {rejected} file(s) that aren't .jpg/.jpeg.",
-            )
+
+
+class DroppableTableWidget(QTableWidget):
+    """A QTableWidget that also accepts JPEG file drops directly onto the
+    list, working exactly like the DropZone above it (same filtering)."""
+
+    filesDropped = pyqtSignal(list)
+
+    def __init__(self, rows: int, columns: int, parent: QWidget | None = None) -> None:
+        super().__init__(rows, columns, parent)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
+        paths = [Path(u.toLocalFile()) for u in event.mimeData().urls() if u.isLocalFile()]
+        jpegs = filter_dropped_jpegs(self, paths)
+        if jpegs:
+            self.filesDropped.emit(jpegs)
 
 
 # --------------------------------------------------------------------------
@@ -399,7 +427,8 @@ class RotateTab(QWidget):
 
         self.THUMBNAIL_SIZE = 60
 
-        self.file_table = QTableWidget(0, 3)
+        self.file_table = DroppableTableWidget(0, 3)
+        self.file_table.filesDropped.connect(self.add_files)
         self.file_table.setIconSize(QSize(self.THUMBNAIL_SIZE, self.THUMBNAIL_SIZE))
         self.file_table.horizontalHeader().hide()
         self.file_table.verticalHeader().hide()
@@ -789,6 +818,7 @@ class ImageCropView(QWidget):
     """
 
     selectionChanged = pyqtSignal(object)  # QRect (image coords) or None
+    filesDropped = pyqtSignal(list)  # dropping a file here works like the drop zone above
 
     HANDLE = 8
     MAX_ZOOM = 32
@@ -797,6 +827,7 @@ class ImageCropView(QWidget):
         super().__init__(parent)
         self.setMinimumHeight(300)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setAcceptDrops(True)
         self._image: QImage | None = None
         self._crop: QRect | None = None  # image pixel coords
         self._scale = 1.0
@@ -1013,6 +1044,18 @@ class ImageCropView(QWidget):
         y2 = max(y + 1, min(r.y() + r.height(), ih))
         return QRect(QPoint(x, y), QPoint(x2, y2))
 
+    # -- drag-and-drop --------------------------------------------------------
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
+        paths = [Path(u.toLocalFile()) for u in event.mimeData().urls() if u.isLocalFile()]
+        jpegs = filter_dropped_jpegs(self, paths)
+        if jpegs:
+            self.filesDropped.emit(jpegs)
+
     # -- painting -------------------------------------------------------------
 
     def resizeEvent(self, event) -> None:  # noqa: N802
@@ -1203,6 +1246,7 @@ class CropTab(QWidget):
 
         self.crop_view = ImageCropView()
         self.crop_view.selectionChanged.connect(self._on_selection_changed)
+        self.crop_view.filesDropped.connect(self.load_file)
         layout.addWidget(self.crop_view, stretch=1)
 
         save_controls_row = QHBoxLayout()

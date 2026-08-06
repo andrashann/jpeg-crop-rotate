@@ -13,6 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
 from PIL import Image
+from PyQt6.QtCore import QMimeData, QPointF, Qt, QUrl
+from PyQt6.QtGui import QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import QApplication
 
 import app
@@ -78,3 +80,19 @@ def command_log():
 @pytest.fixture
 def session_state():
     return app.SessionState()
+
+
+def synth_drop(widget, paths: list[Path]) -> None:
+    """Simulate an OS-level file drag-and-drop of `paths` onto `widget`,
+    exactly like a real drag from Finder/Explorer would deliver."""
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(p)) for p in paths])
+    pos = QPointF(10, 10)
+    enter_event = QDragEnterEvent(
+        pos.toPoint(), Qt.DropAction.CopyAction, mime, Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier
+    )
+    widget.dragEnterEvent(enter_event)
+    drop_event = QDropEvent(
+        pos, Qt.DropAction.CopyAction, mime, Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier
+    )
+    widget.dropEvent(drop_event)

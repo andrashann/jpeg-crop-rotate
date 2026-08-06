@@ -10,6 +10,7 @@ from PyQt6.QtCore import QRect
 from PyQt6.QtGui import QImage
 
 import app
+from conftest import synth_drop
 
 
 def make_crop_tab(jpegtran_path, command_log, session_state):
@@ -351,3 +352,15 @@ def test_in_place_mode_does_not_use_the_existing_target_prompt(
     with patch.object(app, "confirm_existing_target") as mock_confirm:
         tab.save_crop()
         assert not mock_confirm.called
+
+
+# -- drag-and-drop directly onto the image viewer -----------------------------
+
+
+def test_dropping_a_file_onto_the_viewer_loads_it_like_the_drop_zone(
+    qapp, jpegtran_path, command_log, session_state, sample_jpeg
+):
+    tab = make_crop_tab(jpegtran_path, command_log, session_state)
+    synth_drop(tab.crop_view, [sample_jpeg])
+    assert tab.current_file == sample_jpeg
+    assert tab.crop_view.has_image()

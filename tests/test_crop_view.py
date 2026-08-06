@@ -1,10 +1,13 @@
 """ImageCropView: rotate-rect math, the zoom/pan "virtual camera", tool
 switching (crop vs. move), crop-snap precision while zoomed, wheel-to-zoom,
-and the crop-dimension label positioning regression."""
+drag-and-drop, and the crop-dimension label positioning regression."""
+from unittest.mock import patch
+
 from PyQt6.QtCore import QPoint, QPointF, QRect, Qt
 from PyQt6.QtGui import QMouseEvent, QWheelEvent
 
 import app
+from conftest import synth_drop
 
 
 def synth_wheel(view, pos: QPoint, angle_delta_y: int) -> None:
@@ -316,6 +319,32 @@ def test_rotate_dimension_swaps(qapp, sample_jpeg):
     view.rotate_image(clockwise=True)
     assert (view._image.width(), view._image.height()) == (orig_h, orig_w)
     assert view.rotation_degrees == 90
+
+
+# -- drag-and-drop ------------------------------------------------------------
+
+
+def test_dropping_a_file_directly_onto_the_viewer_emits_filesDropped(qapp, sample_jpeg):
+    view = app.ImageCropView()
+    received = []
+    view.filesDropped.connect(received.extend)
+    synth_drop(view, [sample_jpeg])
+    assert received == [sample_jpeg]
+
+
+def test_dropping_a_non_jpeg_onto_the_viewer_is_rejected_with_a_warning(qapp, tmp_path):
+    view = app.ImageCropView()
+    received = []
+    view.filesDropped.connect(received.extend)
+
+    not_a_jpeg = tmp_path / "notes.txt"
+    not_a_jpeg.write_text("hello")
+
+    with patch.object(app.QMessageBox, "warning") as mock_warning:
+        synth_drop(view, [not_a_jpeg])
+        assert mock_warning.called
+
+    assert received == []
 
 
 # -- crop-dimension label position regression --------------------------------
