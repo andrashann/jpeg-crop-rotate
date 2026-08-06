@@ -1,8 +1,10 @@
 """CropTab: the in-memory snapshot (survives the original being overwritten),
 save-crop pipeline (postfix/in-place, source vs. target folder), rotate-only
 saves, and toolbar-driven clear/rotate."""
+import inspect
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 from PyQt6.QtCore import QRect
 from PyQt6.QtGui import QImage
@@ -206,3 +208,77 @@ def test_clear_selection_button_clears_selection_without_unloading(qapp, jpegtra
     assert not tab.crop_view.toolbar.clear_button.isEnabled()
     assert not tab.save_button.isEnabled()
     assert tab.crop_view.has_image()
+
+
+# -- undecodable images (corrupt, unsupported, or too large for Qt) ----------
+
+
+def test_load_file_shows_error_and_does_not_falsely_claim_loaded_when_qt_rejects_the_image(
+    qapp, jpegtran_path, command_log, session_state, make_jpeg
+):
+    """Exercises the same failure path a genuinely oversized image hits
+    against Qt's image allocation limit (QImageReader.setAllocationLimit) --
+    using a deliberately tiny limit against a modestly-sized fixture here so
+    the test stays fast, rather than generating a real multi-hundred-MB image.
+    """
+    # 600x600 decodes to ~1.4MB as RGB32 -- bigger than the 1MB limit below.
+    # (The default small `sample_jpeg` fixture is only ~0.1MB decoded, which
+    # a 1MB limit -- the smallest nonzero value setAllocationLimit takes --
+    # wouldn't actually reject.)
+    oversized_for_the_limit = make_jpeg(size=(600, 600))
+
+    tab = make_crop_tab(jpegtran_path, command_log, session_state)
+    original_limit = app.QImageReader.allocationLimit()
+    app.QImageReader.setAllocationLimit(1)  # MB
+    try:
+        with patch.object(app.QMessageBox, "critical") as mock_critical:
+            tab.load_file([oversized_for_the_limit])
+            assert mock_critical.called
+    finally:
+        app.QImageReader.setAllocationLimit(original_limit)
+
+    assert tab.current_file is None
+    assert not tab.crop_view.has_image()
+    assert tab.status_label.text() == "", "must not claim 'Loaded' when the decode failed"
+
+
+def test_load_file_with_garbage_data_shows_error(qapp, jpegtran_path, command_log, session_state, tmp_path):
+    tab = make_crop_tab(jpegtran_path, command_log, session_state)
+    bad_file = tmp_path / "not_really_a_jpeg.jpg"
+    bad_file.write_bytes(b"this is not jpeg data" * 100)
+
+    with patch.object(app.QMessageBox, "critical") as mock_critical:
+        tab.load_file([bad_file])
+        assert mock_critical.called
+
+    assert tab.current_file is None
+    assert not tab.crop_view.has_image()
+
+
+def test_failed_load_does_not_disturb_a_previously_loaded_files_snapshot(
+    qapp, jpegtran_path, command_log, session_state, sample_jpeg, tmp_path
+):
+    """A failed load of a second file must not tear down the first file's
+    still-displayed snapshot out from under it."""
+    tab = make_crop_tab(jpegtran_path, command_log, session_state)
+    tab.load_file([sample_jpeg])
+    first_snapshot = tab._snapshot_path
+    assert first_snapshot.exists()
+
+    bad_file = tmp_path / "bad.jpg"
+    bad_file.write_bytes(b"garbage")
+    with patch.object(app.QMessageBox, "critical"):
+        tab.load_file([bad_file])
+
+    assert tab.current_file == sample_jpeg, "should still show the first (successfully loaded) file"
+    assert tab._snapshot_path == first_snapshot
+    assert first_snapshot.exists(), "first file's snapshot must survive the second file's failed load"
+
+
+def test_main_raises_the_image_allocation_limit():
+    """Guards the actual fix: without this, `jpegtran` itself is unaffected
+    (it's a subprocess with no such limit), but Qt's own image loading --
+    used for the Crop tab preview -- refuses anything whose decoded buffer
+    would exceed 256MB by default, which real photos/scans routinely do."""
+    src = inspect.getsource(app.main)
+    assert "QImageReader.setAllocationLimit" in src

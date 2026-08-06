@@ -801,8 +801,14 @@ class ImageCropView(QWidget):
         self.selectionChanged.connect(self._sync_toolbar)
         self._reposition_toolbar()
 
-    def load_image(self, path: Path) -> None:
+    def load_image(self, path: Path) -> bool:
+        """Returns False if the file couldn't be decoded (corrupt, an
+        unsupported format, or too large for Qt's image allocation limit)."""
         self._image = QImage(str(path))
+        if self._image.isNull():
+            self.toolbar.set_image_loaded(False)
+            self.update()
+            return False
         self._crop = None
         self.rotation_degrees = 0
         self._zoom = 1
@@ -814,6 +820,7 @@ class ImageCropView(QWidget):
         self._recompute_view()
         self.update()
         self.selectionChanged.emit(None)
+        return True
 
     def has_image(self) -> bool:
         return self._image is not None and not self._image.isNull()
@@ -1194,7 +1201,6 @@ class CropTab(QWidget):
             QMessageBox.information(self, "Single file only", "Crop only supports one file at a time — using the first.")
         new_file = paths[0]
 
-        self._cleanup_snapshot()
         try:
             snapshot_path = self._make_system_temp_path(new_file.suffix)
             shutil.copy2(new_file, snapshot_path)
@@ -1202,9 +1208,23 @@ class CropTab(QWidget):
             QMessageBox.critical(self, "Couldn't load file", f"Failed to read {display_path(new_file)}:\n{exc}")
             return
 
+        if not self.crop_view.load_image(snapshot_path):
+            snapshot_path.unlink(missing_ok=True)
+            QMessageBox.critical(
+                self,
+                "Couldn't load image",
+                f"{display_path(new_file)} could not be decoded — it may be "
+                "corrupt, an unsupported format, or too large to preview.",
+            )
+            return
+
+        # Only discard the previous file's snapshot once the new one is
+        # confirmed to have loaded — otherwise a failed load here would
+        # leave the previously-loaded file's snapshot dangling while the UI
+        # still shows it as loaded.
+        self._cleanup_snapshot()
         self.current_file = new_file
         self._snapshot_path = snapshot_path
-        self.crop_view.load_image(self._snapshot_path)
         self.save_mode.set_default_target_folder(new_file.parent)
         self.status_label.setText(f"Loaded: {display_path(self.current_file)}")
         self.save_button.setEnabled(False)
@@ -1358,6 +1378,13 @@ class MainWindow(QMainWindow):
 
 def main() -> None:
     app = QApplication(sys.argv)
+
+    # Qt refuses to decode an image whose decoded pixel buffer would exceed
+    # this limit (default 256 MB), as a guard against decompression-bomb
+    # files. This app is specifically for editing large photos/scans, so
+    # raise it generously -- still bounded, so a truly pathological/corrupt
+    # file can't make Qt try to allocate an unbounded amount of memory.
+    QImageReader.setAllocationLimit(4096)
 
     jpegtran_path = find_jpegtran()
     if jpegtran_path is None:
