@@ -42,6 +42,25 @@ def test_add_files_dedupes(qapp, jpegtran_path, command_log, session_state, samp
     assert tab.file_table.rowCount() == 1
 
 
+def test_add_files_rejects_a_file_with_a_jpeg_extension_but_non_jpeg_content(
+    qapp, jpegtran_path, command_log, session_state, sample_jpeg, tmp_path
+):
+    """The drop zone only filters by .jpg/.jpeg extension, which doesn't
+    guarantee the content actually is one (e.g. a renamed text file) --
+    add_files must reject it rather than silently listing an unprocessable
+    row."""
+    fake_jpeg = tmp_path / "not_really_a_jpeg.jpeg"
+    fake_jpeg.write_text("this is plain text, not image data")
+
+    tab = make_rotate_tab(jpegtran_path, command_log, session_state)
+    with patch.object(app.QMessageBox, "warning") as mock_warning:
+        tab.add_files([fake_jpeg, sample_jpeg])
+        assert mock_warning.called
+
+    assert tab.files == [sample_jpeg], "only the real JPEG should have been added"
+    assert tab.file_table.rowCount() == 1
+
+
 def test_thumbnail_is_decoded_at_the_configured_size(qapp, jpegtran_path, command_log, session_state, sample_jpeg):
     tab = make_rotate_tab(jpegtran_path, command_log, session_state)
     tab.THUMBNAIL_SIZE = 60

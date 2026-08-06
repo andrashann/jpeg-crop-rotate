@@ -447,18 +447,35 @@ class RotateTab(QWidget):
             self.add_files([Path(p) for p in paths])
 
     def add_files(self, paths: list[Path]) -> None:
+        rejected = []
         for p in paths:
-            if p not in self.files:
-                self.files.append(p)
-                self._add_row(p)
+            if p in self.files:
+                continue
+            # The drop zone only filtered by .jpg/.jpeg extension, which
+            # doesn't guarantee the content is actually a JPEG (e.g. a
+            # renamed text file) -- decode it for real here, since we need
+            # the thumbnail anyway, and skip files that fail.
+            thumbnail = self._make_thumbnail(p, self.THUMBNAIL_SIZE)
+            if thumbnail.isNull():
+                rejected.append(p)
+                continue
+            self.files.append(p)
+            self._add_row(p, thumbnail)
         self._update_default_target_folder()
+        if rejected:
+            names = "\n".join(display_path(p) for p in rejected)
+            QMessageBox.warning(
+                self,
+                "Couldn't read file(s)",
+                f"Ignored {len(rejected)} file(s) that aren't valid JPEG images:\n{names}",
+            )
 
-    def _add_row(self, path: Path) -> None:
+    def _add_row(self, path: Path, thumbnail: QPixmap) -> None:
         row = self.file_table.rowCount()
         self.file_table.insertRow(row)
 
         thumb_item = QTableWidgetItem()
-        thumb_item.setIcon(QIcon(self._make_thumbnail(path, self.THUMBNAIL_SIZE)))
+        thumb_item.setIcon(QIcon(thumbnail))
         thumb_item.setFlags(thumb_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         self.file_table.setItem(row, 0, thumb_item)
 
