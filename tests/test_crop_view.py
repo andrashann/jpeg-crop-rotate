@@ -1,10 +1,24 @@
 """ImageCropView: rotate-rect math, the zoom/pan "virtual camera", tool
-switching (crop vs. move), crop-snap precision while zoomed, and the
-crop-dimension label positioning regression."""
+switching (crop vs. move), crop-snap precision while zoomed, wheel-to-zoom,
+and the crop-dimension label positioning regression."""
 from PyQt6.QtCore import QPoint, QPointF, QRect, Qt
-from PyQt6.QtGui import QMouseEvent
+from PyQt6.QtGui import QMouseEvent, QWheelEvent
 
 import app
+
+
+def synth_wheel(view, pos: QPoint, angle_delta_y: int) -> None:
+    ev = QWheelEvent(
+        QPointF(pos),
+        QPointF(pos),
+        QPoint(0, 0),
+        QPoint(0, angle_delta_y),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.NoScrollPhase,
+        False,
+    )
+    view.wheelEvent(ev)
 
 
 def synth_mouse(view, kind, pos: QPoint) -> None:
@@ -102,6 +116,93 @@ def test_zooming_back_to_one_auto_switches_off_move_tool(qapp, sample_jpeg):
     assert view._zoom == 1
     assert view._tool == "crop"
     assert view.toolbar.crop_button.isChecked()
+
+
+# -- wheel-to-zoom --------------------------------------------------------------
+
+
+def test_wheel_scroll_up_zooms_in(qapp, sample_jpeg):
+    view = app.ImageCropView()
+    view.resize(400, 300)
+    view.load_image(sample_jpeg)
+    synth_wheel(view, QPoint(200, 150), 120)
+    assert view._zoom == 2
+
+
+def test_wheel_scroll_down_zooms_out(qapp, sample_jpeg):
+    view = app.ImageCropView()
+    view.resize(400, 300)
+    view.load_image(sample_jpeg)
+    view._set_zoom(4)
+    synth_wheel(view, QPoint(200, 150), -120)
+    assert view._zoom == 2
+
+
+def test_wheel_zoom_works_regardless_of_active_tool(qapp, sample_jpeg):
+    view = app.ImageCropView()
+    view.resize(400, 300)
+    view.load_image(sample_jpeg)
+    view._set_zoom(2)
+    view.toolbar.move_button.setChecked(True)
+    assert view._tool == "move"
+
+    synth_wheel(view, QPoint(200, 150), 120)
+    assert view._zoom == 4, "wheel zoom should work no matter which tool is active"
+
+
+def test_wheel_zoom_respects_cap_and_floor(qapp, sample_jpeg):
+    view = app.ImageCropView()
+    view.resize(400, 300)
+    view.load_image(sample_jpeg)
+    for _ in range(10):
+        synth_wheel(view, QPoint(200, 150), 120)
+    assert view._zoom == app.ImageCropView.MAX_ZOOM
+
+    for _ in range(10):
+        synth_wheel(view, QPoint(200, 150), -120)
+    assert view._zoom == 1
+
+
+def test_wheel_accumulates_small_trackpad_style_deltas(qapp, sample_jpeg):
+    view = app.ImageCropView()
+    view.resize(400, 300)
+    view.load_image(sample_jpeg)
+    # Several small deltas that don't individually reach the 120 threshold.
+    for _ in range(5):
+        synth_wheel(view, QPoint(200, 150), 20)
+    assert view._zoom == 1, "should not have zoomed yet (accumulated 100 < 120)"
+    synth_wheel(view, QPoint(200, 150), 20)
+    assert view._zoom == 2, "accumulated total now crosses the 120 threshold"
+
+
+def test_wheel_zoom_anchors_on_cursor_not_viewport_center(qapp, sample_jpeg):
+    """Unlike the toolbar zoom buttons (which zoom toward the viewport
+    center), wheel-zoom should keep the content under the cursor in place.
+
+    Needs a zoom level where the image actually exceeds the viewport in
+    both dimensions -- otherwise panning is forced to 0 (fully centered)
+    regardless of anchor, and the two behaviors would be indistinguishable.
+    """
+    view = app.ImageCropView()
+    view.resize(400, 300)
+    view.load_image(sample_jpeg)
+    view._set_zoom(8)  # 1600x1040 content, well past the 400x300 viewport
+
+    cursor_widget_pt = QPoint(100, 80)  # off-center
+    image_pt_before = view._to_image(cursor_widget_pt)
+    synth_wheel(view, cursor_widget_pt, 120)  # zoom 8 -> 16
+    assert view._zoom == 16
+    image_pt_after = view._to_image(cursor_widget_pt)
+
+    assert abs(image_pt_after.x() - image_pt_before.x()) <= 1
+    assert abs(image_pt_after.y() - image_pt_before.y()) <= 1
+
+
+def test_wheel_zoom_does_nothing_with_no_image_loaded(qapp):
+    view = app.ImageCropView()
+    view.resize(400, 300)
+    synth_wheel(view, QPoint(200, 150), 120)  # must not raise
+    assert view._zoom == 1
 
 
 # -- panning ------------------------------------------------------------------

@@ -787,6 +787,7 @@ class ImageCropView(QWidget):
         self._drag_start_crop: QRect | None = None
         self._pan_drag_start_mouse: QPoint | None = None
         self._pan_drag_start_pan: QPointF | None = None
+        self._wheel_accum = 0  # accumulated angleDelta; smooths out trackpad scroll ticks
         self.rotation_degrees = 0  # cumulative CW rotation (0/90/180/270) applied since load
 
         self.toolbar = CropToolbar(self)
@@ -806,6 +807,7 @@ class ImageCropView(QWidget):
         self.rotation_degrees = 0
         self._zoom = 1
         self._pan = QPointF(0.0, 0.0)
+        self._wheel_accum = 0
         self._tool = "crop"
         self.toolbar.set_tool("crop")
         self.toolbar.set_image_loaded(True)
@@ -825,6 +827,7 @@ class ImageCropView(QWidget):
         self.rotation_degrees = 0
         self._zoom = 1
         self._pan = QPointF(0.0, 0.0)
+        self._wheel_accum = 0
         self._tool = "crop"
         self.toolbar.set_tool("crop")
         self.toolbar.set_image_loaded(False)
@@ -879,21 +882,24 @@ class ImageCropView(QWidget):
     def _reset_zoom(self) -> None:
         self._set_zoom(1)
 
-    def _set_zoom(self, new_zoom: int) -> None:
+    def _set_zoom(self, new_zoom: int, anchor: QPoint | None = None) -> None:
+        """Change zoom, keeping the content under `anchor` (widget coords) in
+        place — defaults to the viewport center (used by the toolbar
+        buttons); wheelEvent passes the cursor position instead."""
         if not self.has_image() or new_zoom == self._zoom:
             return
         avail_w, avail_h = self.width(), self.height()
-        # Zoom toward the current viewport center, so the same content stays
-        # in view rather than jumping to the image's top-left corner.
-        focus = self._to_image(QPoint(avail_w // 2, avail_h // 2))
+        if anchor is None:
+            anchor = QPoint(avail_w // 2, avail_h // 2)
+        focus = self._to_image(anchor)
 
         self._zoom = new_zoom
         iw, ih = self._image.width(), self._image.height()
         base_scale = min(avail_w / iw, avail_h / ih, 1.0) if avail_w and avail_h else 1.0
         effective_scale = base_scale * self._zoom
         self._pan = QPointF(
-            focus.x() * effective_scale - avail_w / 2,
-            focus.y() * effective_scale - avail_h / 2,
+            focus.x() * effective_scale - anchor.x(),
+            focus.y() * effective_scale - anchor.y(),
         )
         if self._zoom == 1 and self._tool == "move":
             self._set_tool("crop")
@@ -1116,6 +1122,27 @@ class ImageCropView(QWidget):
         if self._drag_mode is not None:
             self._drag_mode = None
             self.selectionChanged.emit(self._crop)
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        """Scroll to zoom, centered on the cursor — works regardless of the
+        active tool, since wheel events are independent of mouse-drag
+        handling above."""
+        if not self.has_image():
+            return
+        # Accumulate rather than react to every tick: a real mouse sends one
+        # +-120 step per click, but trackpads send a stream of small deltas
+        # for one physical gesture — without this a single swipe would blow
+        # through several zoom levels at once.
+        self._wheel_accum += event.angleDelta().y()
+        step = 120
+        if abs(self._wheel_accum) < step:
+            event.accept()
+            return
+        zooming_in = self._wheel_accum > 0
+        self._wheel_accum = 0
+        new_zoom = min(self._zoom * 2, self.MAX_ZOOM) if zooming_in else max(self._zoom // 2, 1)
+        self._set_zoom(new_zoom, event.position().toPoint())
+        event.accept()
 
 
 class CropTab(QWidget):
