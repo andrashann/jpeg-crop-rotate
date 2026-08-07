@@ -38,6 +38,7 @@ from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QFileDialog,
     QFrame,
@@ -90,6 +91,10 @@ def find_jpegtran() -> str | None:
     return shutil.which("jpegtran")
 
 
+def find_cjpeg() -> str | None:
+    return shutil.which("cjpeg")
+
+
 @dataclass
 class JpegtranResult:
     ok: bool
@@ -97,8 +102,10 @@ class JpegtranResult:
     stderr: str = ""
 
 
-def run_jpegtran(jpegtran_path: str, args: list[str], infile: Path, outfile: Path) -> JpegtranResult:
-    command = [jpegtran_path, "-copy", "all", *args, "-outfile", str(outfile), str(infile)]
+def run_jpegtran(
+    jpegtran_path: str, args: list[str], infile: Path, outfile: Path, copy_mode: str = "all"
+) -> JpegtranResult:
+    command = [jpegtran_path, "-copy", copy_mode, *args, "-outfile", str(outfile), str(infile)]
     proc = subprocess.run(command, capture_output=True, text=True)
     return JpegtranResult(ok=proc.returncode == 0, command=command, stderr=proc.stderr.strip())
 
@@ -122,6 +129,182 @@ def build_postfix_path(infile: Path, postfix: str, target_dir: Path | None = Non
 
 def is_jpeg(path: Path) -> bool:
     return path.suffix.lower() in JPEG_EXTENSIONS
+
+
+# --------------------------------------------------------------------------
+# Join plumbing
+#
+# jpegtran has no "create a canvas" operation, only -drop, which pastes one
+# JPEG's DCT coefficients onto another *without decoding either* -- but only
+# at an offset that lands on the target's iMCU grid, and only when both
+# images use the same chroma subsampling. To join two arbitrary photos:
+#   1. Parse each image's SOF marker to read its subsampling and pixel size
+#      (this is the one thing that can't be worked around: if it differs
+#      between the two images, a lossless join isn't possible).
+#   2. Compute a canvas size that fits both images, with each one's offset
+#      rounded to that shared iMCU grid.
+#   3. Synthesize a flat-color canvas at that size via cjpeg (matching
+#      subsampling) -- the only pixels that ever get freshly encoded are the
+#      solid-color background, never the two real photos.
+#   4. -drop each source image onto the canvas in turn, byte-exact.
+# --------------------------------------------------------------------------
+
+
+class JoinIncompatibleError(Exception):
+    """Two images can't be losslessly joined (jpegtran's -drop requires
+    identical chroma subsampling between the dropped file and the target)."""
+
+
+_SOF_MARKERS = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+_NO_PAYLOAD_MARKERS = {0x01, 0xD8} | set(range(0xD0, 0xDA))  # TEM, SOI, RSTn..RST7/SOI dup guard
+
+
+def read_jpeg_frame_info(path: Path) -> tuple[int, int, list[tuple[int, int]]]:
+    """Parse just the SOF marker: (width, height, [(h_sampling, v_sampling), ...] per component)."""
+    data = path.read_bytes()
+    if len(data) < 4 or data[0:2] != b"\xff\xd8":
+        raise ValueError(f"{path}: not a JPEG file")
+    pos = 2
+    while pos < len(data) - 1:
+        if data[pos] != 0xFF:
+            pos += 1
+            continue
+        marker = data[pos + 1]
+        pos += 2
+        if marker in _NO_PAYLOAD_MARKERS:
+            continue
+        if marker == 0xDA or pos + 2 > len(data):
+            break  # start of entropy-coded data (or truncated file) -- no SOF found
+        length = (data[pos] << 8) | data[pos + 1]
+        if marker in _SOF_MARKERS:
+            payload = data[pos + 2 : pos + length]
+            height = (payload[1] << 8) | payload[2]
+            width = (payload[3] << 8) | payload[4]
+            num_components = payload[5]
+            components = []
+            offset = 6
+            for _ in range(num_components):
+                sampling_byte = payload[offset + 1]
+                components.append((sampling_byte >> 4, sampling_byte & 0x0F))
+                offset += 3
+            return width, height, components
+        pos += length
+    raise ValueError(f"{path}: no SOF marker found (not a valid JPEG?)")
+
+
+def jpeg_sampling_factors(components: list[tuple[int, int]]) -> tuple[int, int]:
+    """Max horizontal/vertical sampling factor across components -- an iMCU
+    covers 8 * this many pixels in each direction."""
+    return max(h for h, v in components), max(v for h, v in components)
+
+
+@dataclass
+class JoinLayout:
+    canvas_width: int
+    canvas_height: int
+    first_offset: tuple[int, int]
+    second_offset: tuple[int, int]
+
+
+def compute_join_layout(
+    w1: int, h1: int, w2: int, h2: int, direction: str, mcu_w: int, mcu_h: int
+) -> JoinLayout:
+    """Canvas size + each image's placement offset, both images' offsets
+    aligned to the (mcu_w, mcu_h) grid. The main axis places image 2 right
+    after image 1, rounded *up* to the next iMCU boundary (any slack becomes
+    a thin background-colored gap, never an overlap). The cross axis centers
+    the shorter image, rounded *down* so it can never push past the canvas."""
+
+    def round_up(value: int, multiple: int) -> int:
+        return -(-value // multiple) * multiple
+
+    def center_offset(total: int, size: int, multiple: int) -> int:
+        return max(0, (int((total - size) / 2) // multiple) * multiple)
+
+    if direction == "vertical":
+        canvas_w = max(w1, w2)
+        y1, y2 = 0, round_up(h1, mcu_h)
+        canvas_h = y2 + h2
+        x1 = center_offset(canvas_w, w1, mcu_w)
+        x2 = center_offset(canvas_w, w2, mcu_w)
+    else:
+        canvas_h = max(h1, h2)
+        x1, x2 = 0, round_up(w1, mcu_w)
+        canvas_w = x2 + w2
+        y1 = center_offset(canvas_h, h1, mcu_h)
+        y2 = center_offset(canvas_h, h2, mcu_h)
+
+    return JoinLayout(canvas_w, canvas_h, (x1, y1), (x2, y2))
+
+
+def _write_solid_ppm(path: Path, width: int, height: int, color: QColor) -> None:
+    pixel = bytes((color.red(), color.green(), color.blue()))
+    with open(path, "wb") as f:
+        f.write(f"P6\n{width} {height}\n255\n".encode("ascii"))
+        f.write(pixel * (width * height))
+
+
+def build_joined_jpeg(
+    jpegtran_path: str,
+    cjpeg_path: str,
+    command_log: "CommandLog",
+    first_path: Path,
+    second_path: Path,
+    direction: str,
+    bg_color: QColor,
+    outfile: Path,
+) -> tuple[bool, str]:
+    """Losslessly composite two JPEGs side by side (or stacked). Raises
+    JoinIncompatibleError if their chroma subsampling doesn't match."""
+    w1, h1, comps1 = read_jpeg_frame_info(first_path)
+    w2, h2, comps2 = read_jpeg_frame_info(second_path)
+    if comps1 != comps2:
+        raise JoinIncompatibleError(
+            "These two images use different chroma subsampling, so they can't be "
+            "losslessly joined without re-encoding at least one of them."
+        )
+    h_samp, v_samp = jpeg_sampling_factors(comps1)
+    mcu_w, mcu_h = h_samp * 8, v_samp * 8
+    layout = compute_join_layout(w1, h1, w2, h2, direction, mcu_w, mcu_h)
+
+    fd, ppm_name = tempfile.mkstemp(suffix=".ppm")
+    os.close(fd)
+    ppm_path = Path(ppm_name)
+    fd, canvas_name = tempfile.mkstemp(suffix=".jpg")
+    os.close(fd)
+    canvas_path = Path(canvas_name)
+    fd, step1_name = tempfile.mkstemp(suffix=".jpg")
+    os.close(fd)
+    step1_path = Path(step1_name)
+    try:
+        _write_solid_ppm(ppm_path, layout.canvas_width, layout.canvas_height, bg_color)
+        cjpeg_command = [
+            cjpeg_path, "-quality", "95", "-sample", f"{h_samp}x{v_samp}",
+            "-outfile", str(canvas_path), str(ppm_path),
+        ]
+        proc = subprocess.run(cjpeg_command, capture_output=True, text=True)
+        command_log.log(cjpeg_command, proc.returncode == 0, proc.stderr.strip())
+        if proc.returncode != 0:
+            return False, proc.stderr.strip()
+
+        x1, y1 = layout.first_offset
+        drop1 = run_jpegtran(
+            jpegtran_path, ["-drop", f"+{x1}+{y1}", str(first_path)], canvas_path, step1_path, copy_mode="none"
+        )
+        command_log.log(drop1.command, drop1.ok, drop1.stderr)
+        if not drop1.ok:
+            return False, drop1.stderr
+
+        x2, y2 = layout.second_offset
+        drop2 = run_jpegtran(
+            jpegtran_path, ["-drop", f"+{x2}+{y2}", str(second_path)], step1_path, outfile, copy_mode="none"
+        )
+        command_log.log(drop2.command, drop2.ok, drop2.stderr)
+        return drop2.ok, drop2.stderr
+    finally:
+        ppm_path.unlink(missing_ok=True)
+        canvas_path.unlink(missing_ok=True)
+        step1_path.unlink(missing_ok=True)
 
 
 def filter_dropped_jpegs(parent: QWidget, paths: list[Path]) -> list[Path]:
@@ -326,6 +509,93 @@ class SaveModeWidget(QGroupBox):
             return infile
         target = self._target_folder if self.target_folder_radio.isChecked() else None
         return build_postfix_path(infile, self.postfix(), target)
+
+
+class JoinOutputWidget(QGroupBox):
+    """Output settings for the Join tab: unlike SaveModeWidget there's no
+    in-place/postfix choice (the result is always a brand-new file), just an
+    explicit file name plus the same source-folder-vs-chosen-folder pattern
+    used elsewhere."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__("Output settings", parent)
+        self._target_folder: Path | None = None
+        self._target_folder_user_set = False
+        self._filename_user_set = False
+
+        outer = QVBoxLayout(self)
+
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("File name:"))
+        self.filename_field = QLineEdit()
+        self.filename_field.textEdited.connect(self._on_filename_edited)
+        name_row.addWidget(self.filename_field, 1)
+        outer.addLayout(name_row)
+
+        folder_row = QHBoxLayout()
+        self.source_folder_radio = QRadioButton("Save to source folder")
+        self.source_folder_radio.setChecked(True)
+        self.target_folder_radio = QRadioButton("Save to folder:")
+        self.target_folder_field = QLineEdit()
+        self.target_folder_field.setReadOnly(True)
+        self.target_folder_browse_button = QPushButton("Browse…")
+        self.target_folder_browse_button.clicked.connect(self._browse_target_folder)
+        folder_row.addWidget(self.source_folder_radio)
+        folder_row.addWidget(self.target_folder_radio)
+        folder_row.addWidget(self.target_folder_field, 1)
+        folder_row.addWidget(self.target_folder_browse_button)
+        outer.addLayout(folder_row)
+
+        self._folder_group = QButtonGroup(self)
+        self._folder_group.addButton(self.source_folder_radio)
+        self._folder_group.addButton(self.target_folder_radio)
+        self.target_folder_radio.toggled.connect(self._on_target_folder_radio_toggled)
+        self._update_enabled_states()
+
+    def _on_filename_edited(self, _text: str) -> None:
+        self._filename_user_set = True
+
+    def set_default_filename(self, name: str) -> None:
+        if self._filename_user_set:
+            return
+        self.filename_field.setText(name)
+
+    def filename(self) -> str:
+        return self.filename_field.text().strip()
+
+    def _on_target_folder_radio_toggled(self, checked: bool) -> None:
+        if checked:
+            self._target_folder_user_set = True
+        self._update_enabled_states()
+
+    def _update_enabled_states(self) -> None:
+        target_active = self.target_folder_radio.isChecked()
+        self.target_folder_field.setEnabled(target_active)
+        self.target_folder_browse_button.setEnabled(target_active)
+
+    def _browse_target_folder(self) -> None:
+        start_dir = str(self._target_folder) if self._target_folder else str(Path.home())
+        chosen = QFileDialog.getExistingDirectory(self, "Select target folder", start_dir)
+        if chosen:
+            self._target_folder = Path(chosen)
+            self._target_folder_user_set = True
+            self.target_folder_field.setText(display_path(self._target_folder))
+
+    def set_default_target_folder(self, folder: Path) -> None:
+        if self._target_folder_user_set:
+            return
+        self._target_folder = folder
+        self.target_folder_field.setText(display_path(folder))
+
+    def target_folder(self) -> Path | None:
+        return self._target_folder if self.target_folder_radio.isChecked() else None
+
+    def output_path_for(self, source_folder: Path) -> Path:
+        target = self._target_folder if self.target_folder_radio.isChecked() else source_folder
+        name = self.filename() or "joined.jpg"
+        if not is_jpeg(Path(name)):
+            name += ".jpg"
+        return target / name
 
 
 class DropZone(QFrame):
@@ -1217,6 +1487,281 @@ class ImageCropView(QWidget):
         event.accept()
 
 
+# --------------------------------------------------------------------------
+# Join preview
+# --------------------------------------------------------------------------
+
+
+class PreviewToolbar(QWidget):
+    """Slimmed-down CropToolbar for read-only preview widgets: zoom controls
+    only, same floating overlay chrome."""
+
+    zoomInRequested = pyqtSignal()
+    zoomOutRequested = pyqtSignal()
+    resetZoomRequested = pyqtSignal()
+
+    ICON_SIZE = QSize(20, 20)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("previewToolbar")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(
+            "#previewToolbar { background-color: rgba(255, 255, 255, 165); border-radius: 6px; }"
+            "#previewToolbar QToolButton { border: none; padding: 3px; border-radius: 4px; }"
+            "#previewToolbar QToolButton:hover:!disabled { background-color: rgba(0, 0, 0, 20); }"
+        )
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(2)
+
+        self.zoom_in_button = self._make_button("lc_zoomin.svg", "Zoom in")
+        self.zoom_in_button.clicked.connect(self.zoomInRequested)
+        self.zoom_out_button = self._make_button("lc_zoomout.svg", "Zoom out")
+        self.zoom_out_button.clicked.connect(self.zoomOutRequested)
+        self.reset_zoom_button = self._make_button("lc_view100.svg", "Reset zoom (1:1)")
+        self.reset_zoom_button.clicked.connect(self.resetZoomRequested)
+        layout.addWidget(self.zoom_in_button)
+        layout.addWidget(self.zoom_out_button)
+        layout.addWidget(self.reset_zoom_button)
+        self.set_content_loaded(False)
+
+    def _make_button(self, icon_name: str, tooltip: str) -> QToolButton:
+        button = QToolButton(self)
+        button.setIcon(icon(icon_name))
+        button.setIconSize(self.ICON_SIZE)
+        button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        button.setToolTip(tooltip)
+        button.setAutoRaise(True)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        return button
+
+    def set_zoom_state(self, zoom: int) -> None:
+        self.zoom_in_button.setEnabled(zoom < JoinPreviewView.MAX_ZOOM)
+        self.zoom_out_button.setEnabled(zoom > 1)
+        self.reset_zoom_button.setEnabled(zoom > 1)
+
+    def set_content_loaded(self, loaded: bool) -> None:
+        for button in (self.zoom_in_button, self.zoom_out_button, self.reset_zoom_button):
+            button.setEnabled(loaded)
+        if loaded:
+            self.set_zoom_state(1)
+
+
+class JoinPreviewView(QWidget):
+    """Read-only preview of how two images will be composited.
+
+    Not pixel-accurate to the real jpegtran output (it aligns to a fixed
+    CROP_SNAP grid rather than each file's real iMCU size), but images are
+    scaled to their true relative sizes, so a size mismatch or the
+    background gap is visible before running the real (lossless) pipeline.
+    Visual chrome mirrors ImageCropView: dark backdrop, floating toolbar.
+    """
+
+    filesDropped = pyqtSignal(list)  # dropping a file here works like the drop zone above
+
+    MAX_ZOOM = 32
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setMinimumHeight(300)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setAcceptDrops(True)
+        self._image1: QImage | None = None
+        self._image2: QImage | None = None
+        self._direction = "horizontal"
+        self._bg_color = QColor("white")
+        self._canvas_size = QSize(0, 0)
+        self._pos1 = QPoint(0, 0)
+        self._pos2 = QPoint(0, 0)
+        self._zoom = 1
+        self._pan = QPointF(0.0, 0.0)
+        self._scale = 1.0
+        self._offset = QPointF(0.0, 0.0)
+        self._wheel_accum = 0
+        self._pan_drag_start_mouse: QPoint | None = None
+        self._pan_drag_start_pan: QPointF | None = None
+
+        self.toolbar = PreviewToolbar(self)
+        self.toolbar.zoomInRequested.connect(self._zoom_in)
+        self.toolbar.zoomOutRequested.connect(self._zoom_out)
+        self.toolbar.resetZoomRequested.connect(self._reset_zoom)
+        self._reposition_toolbar()
+
+    def set_images(self, image1: QImage | None, image2: QImage | None, direction: str, bg_color: QColor) -> None:
+        self._image1 = image1
+        self._image2 = image2
+        self._direction = direction
+        self._bg_color = bg_color
+        self._zoom = 1
+        self._pan = QPointF(0.0, 0.0)
+        self._recompute_layout()
+        self.toolbar.set_content_loaded(self._canvas_size.width() > 0)
+        self._recompute_view()
+        self.update()
+
+    def _recompute_layout(self) -> None:
+        if self._image1 is None and self._image2 is None:
+            self._canvas_size = QSize(0, 0)
+            return
+        if self._image2 is None:
+            self._canvas_size = QSize(self._image1.width(), self._image1.height())
+            self._pos1, self._pos2 = QPoint(0, 0), QPoint(0, 0)
+            return
+        if self._image1 is None:
+            self._canvas_size = QSize(self._image2.width(), self._image2.height())
+            self._pos1, self._pos2 = QPoint(0, 0), QPoint(0, 0)
+            return
+        w1, h1 = self._image1.width(), self._image1.height()
+        w2, h2 = self._image2.width(), self._image2.height()
+        layout = compute_join_layout(w1, h1, w2, h2, self._direction, CROP_SNAP, CROP_SNAP)
+        self._canvas_size = QSize(layout.canvas_width, layout.canvas_height)
+        self._pos1 = QPoint(*layout.first_offset)
+        self._pos2 = QPoint(*layout.second_offset)
+
+    # -- zoom (mirrors ImageCropView) ----------------------------------------
+
+    def _zoom_in(self) -> None:
+        self._set_zoom(min(self._zoom * 2, self.MAX_ZOOM))
+
+    def _zoom_out(self) -> None:
+        self._set_zoom(max(self._zoom // 2, 1))
+
+    def _reset_zoom(self) -> None:
+        self._set_zoom(1)
+
+    def _set_zoom(self, new_zoom: int, anchor: QPoint | None = None) -> None:
+        if self._canvas_size.width() == 0 or new_zoom == self._zoom:
+            return
+        avail_w, avail_h = self.width(), self.height()
+        if anchor is None:
+            anchor = QPoint(avail_w // 2, avail_h // 2)
+        focus = self._to_content_f(QPointF(anchor))
+
+        self._zoom = new_zoom
+        cw, ch = self._canvas_size.width(), self._canvas_size.height()
+        base_scale = min(avail_w / cw, avail_h / ch, 1.0) if avail_w and avail_h else 1.0
+        effective_scale = base_scale * self._zoom
+        self._pan = QPointF(focus.x() * effective_scale - anchor.x(), focus.y() * effective_scale - anchor.y())
+
+        self._recompute_view()
+        self.toolbar.set_zoom_state(self._zoom)
+        self.update()
+
+    def _reposition_toolbar(self) -> None:
+        self.toolbar.adjustSize()
+        self.toolbar.move(8, 8)
+
+    # -- coordinate mapping ---------------------------------------------------
+
+    def _recompute_view(self) -> None:
+        cw, ch = self._canvas_size.width(), self._canvas_size.height()
+        if not cw or not ch:
+            return
+        avail_w, avail_h = self.width(), self.height()
+        if not avail_w or not avail_h:
+            return
+        base_scale = min(avail_w / cw, avail_h / ch, 1.0)
+        effective_scale = base_scale * self._zoom
+        disp_w, disp_h = cw * effective_scale, ch * effective_scale
+
+        if disp_w <= avail_w:
+            offset_x = (avail_w - disp_w) / 2
+            self._pan.setX(0.0)
+        else:
+            offset_x = -max(0.0, min(self._pan.x(), disp_w - avail_w))
+        if disp_h <= avail_h:
+            offset_y = (avail_h - disp_h) / 2
+            self._pan.setY(0.0)
+        else:
+            offset_y = -max(0.0, min(self._pan.y(), disp_h - avail_h))
+
+        self._scale = effective_scale
+        self._offset = QPointF(offset_x, offset_y)
+
+    def _to_content_f(self, widget_pt: QPointF) -> QPointF:
+        return QPointF((widget_pt.x() - self._offset.x()) / self._scale, (widget_pt.y() - self._offset.y()) / self._scale)
+
+    def _to_widget_rect(self, x: float, y: float, w: float, h: float) -> QRectF:
+        return QRectF(
+            self._offset.x() + x * self._scale, self._offset.y() + y * self._scale, w * self._scale, h * self._scale
+        )
+
+    # -- drag-and-drop --------------------------------------------------------
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
+        paths = [Path(u.toLocalFile()) for u in event.mimeData().urls() if u.isLocalFile()]
+        jpegs = filter_dropped_jpegs(self, paths)
+        if jpegs:
+            self.filesDropped.emit(jpegs)
+
+    # -- pan + zoom input -------------------------------------------------
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if self._canvas_size.width() == 0 or self._zoom == 1:
+            return
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._pan_drag_start_mouse = event.position().toPoint()
+            self._pan_drag_start_pan = QPointF(self._pan)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._pan_drag_start_mouse is None:
+            return
+        pt = event.position().toPoint()
+        dx = pt.x() - self._pan_drag_start_mouse.x()
+        dy = pt.y() - self._pan_drag_start_mouse.y()
+        self._pan = QPointF(self._pan_drag_start_pan.x() - dx, self._pan_drag_start_pan.y() - dy)
+        self._recompute_view()
+        self.update()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._pan_drag_start_mouse = None
+        self._pan_drag_start_pan = None
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        if self._canvas_size.width() == 0:
+            return
+        self._wheel_accum += event.angleDelta().y()
+        step = 120
+        if abs(self._wheel_accum) < step:
+            event.accept()
+            return
+        zooming_in = self._wheel_accum > 0
+        self._wheel_accum = 0
+        new_zoom = min(self._zoom * 2, self.MAX_ZOOM) if zooming_in else max(self._zoom // 2, 1)
+        self._set_zoom(new_zoom, event.position().toPoint())
+        event.accept()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        self._recompute_view()
+        self._reposition_toolbar()
+        super().resizeEvent(event)
+
+    # -- painting ---------------------------------------------------------
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#222"))
+        if self._canvas_size.width() == 0:
+            painter.setPen(QColor("#aaa"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Drop two JPEG files above")
+            return
+
+        self._recompute_view()
+        canvas_rect = self._to_widget_rect(0, 0, self._canvas_size.width(), self._canvas_size.height())
+        painter.fillRect(canvas_rect, self._bg_color)
+        if self._image1 is not None:
+            r1 = self._to_widget_rect(self._pos1.x(), self._pos1.y(), self._image1.width(), self._image1.height())
+            painter.drawImage(r1, self._image1)
+        if self._image2 is not None:
+            r2 = self._to_widget_rect(self._pos2.x(), self._pos2.y(), self._image2.width(), self._image2.height())
+            painter.drawImage(r2, self._image2)
+
+
 class CropTab(QWidget):
     def __init__(
         self,
@@ -1409,6 +1954,183 @@ class CropTab(QWidget):
 
 
 # --------------------------------------------------------------------------
+# Join tab
+# --------------------------------------------------------------------------
+
+
+class JoinTab(QWidget):
+    DIRECTION_ICONS = {
+        "horizontal": "lc_arrowshapes.left-right-arrow.svg",
+        "vertical": "lc_arrowshapes.up-down-arrow.svg",
+    }
+
+    def __init__(
+        self,
+        jpegtran_path: str,
+        command_log: CommandLog,
+        session_state: SessionState,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.jpegtran_path = jpegtran_path
+        self.cjpeg_path = find_cjpeg()
+        self.command_log = command_log
+        self.session_state = session_state
+        self._loaded: list[Path] = []  # at most 2; newest drops evict the oldest
+        self._bg_color = QColor("white")
+
+        layout = QVBoxLayout(self)
+
+        self.drop_zone = DropZone("Drop two JPEG files here (first = left/top, second = right/bottom)")
+        self.drop_zone.filesDropped.connect(self._on_files_dropped)
+        layout.addWidget(self.drop_zone)
+
+        controls_row = QHBoxLayout()
+        controls_row.addWidget(QLabel("Direction:"))
+        self.direction_combo = QComboBox()
+        self.direction_combo.addItem("Horizontal (side by side)", "horizontal")
+        self.direction_combo.addItem("Vertical (stacked)", "vertical")
+        self.direction_combo.currentIndexChanged.connect(self._on_direction_changed)
+        controls_row.addWidget(self.direction_combo)
+
+        self.switch_button = QToolButton()
+        self.switch_button.setToolTip("Swap left/top and right/bottom images")
+        self.switch_button.setIconSize(QSize(20, 20))
+        self.switch_button.clicked.connect(self._on_switch_clicked)
+        controls_row.addWidget(self.switch_button)
+
+        controls_row.addSpacing(16)
+        controls_row.addWidget(QLabel("Background:"))
+        self.color_button = QPushButton()
+        self.color_button.setFixedWidth(40)
+        self.color_button.clicked.connect(self._pick_color)
+        controls_row.addWidget(self.color_button)
+        controls_row.addStretch(1)
+        layout.addLayout(controls_row)
+
+        self.preview = JoinPreviewView()
+        self.preview.filesDropped.connect(self._on_files_dropped)
+        layout.addWidget(self.preview, stretch=1)
+
+        self.output_settings = JoinOutputWidget()
+        layout.addWidget(self.output_settings)
+
+        self.status_label = QLabel("")
+        layout.addWidget(self.status_label)
+
+        self.join_button = QPushButton("Join images")
+        self.join_button.setEnabled(False)
+        self.join_button.clicked.connect(self._do_join)
+        layout.addWidget(self.join_button)
+
+        self._update_color_button()
+        self._update_direction_icon()
+
+    def _direction(self) -> str:
+        return self.direction_combo.currentData()
+
+    @property
+    def _first_path(self) -> Path | None:
+        return self._loaded[0] if len(self._loaded) >= 1 else None
+
+    @property
+    def _second_path(self) -> Path | None:
+        return self._loaded[1] if len(self._loaded) >= 2 else None
+
+    def _on_files_dropped(self, paths: list[Path]) -> None:
+        self._loaded = (self._loaded + paths)[-2:]
+        self._reload_preview()
+
+    def _on_switch_clicked(self) -> None:
+        self._loaded = list(reversed(self._loaded))
+        self._reload_preview()
+
+    def _on_direction_changed(self, _index: int) -> None:
+        self._update_direction_icon()
+        self._reload_preview()
+
+    def _update_direction_icon(self) -> None:
+        self.switch_button.setIcon(icon(self.DIRECTION_ICONS[self._direction()]))
+
+    def _pick_color(self) -> None:
+        chosen = QColorDialog.getColor(self._bg_color, self, "Choose background color")
+        if chosen.isValid():
+            self._bg_color = chosen
+            self._update_color_button()
+            self._reload_preview()
+
+    def _update_color_button(self) -> None:
+        self.color_button.setStyleSheet(f"background-color: {self._bg_color.name()}; border: 1px solid #888;")
+
+    def _load_preview_image(self, path: Path) -> QImage | None:
+        image = QImage(str(path))
+        if image.isNull():
+            QMessageBox.critical(
+                self,
+                "Couldn't load image",
+                f"{display_path(path)} could not be decoded — it may be corrupt, "
+                "an unsupported format, or too large to preview.",
+            )
+            return None
+        return image
+
+    def _reload_preview(self) -> None:
+        first_path, second_path = self._first_path, self._second_path
+        image1 = self._load_preview_image(first_path) if first_path else None
+        image2 = self._load_preview_image(second_path) if second_path else None
+        # Drop any file that failed to decode so a corrupt/oversized image
+        # doesn't linger silently as one of the two "loaded" slots.
+        self._loaded = []
+        if first_path is not None and image1 is not None:
+            self._loaded.append(first_path)
+        if second_path is not None and image2 is not None:
+            self._loaded.append(second_path)
+
+        self.preview.set_images(image1, image2, self._direction(), self._bg_color)
+
+        first_path, second_path = self._first_path, self._second_path
+        if first_path and second_path:
+            self.output_settings.set_default_filename(f"{first_path.stem}_{second_path.stem}.jpg")
+            self.output_settings.set_default_target_folder(first_path.parent)
+        self.join_button.setEnabled(bool(first_path and second_path))
+        self.status_label.setText("")
+
+    def _do_join(self) -> None:
+        first_path, second_path = self._first_path, self._second_path
+        if first_path is None or second_path is None:
+            return
+        if self.cjpeg_path is None:
+            QMessageBox.critical(
+                self,
+                "cjpeg not found",
+                "Join requires the 'cjpeg' command-line tool (installed alongside "
+                "jpegtran by jpeg-turbo), which was not found on your PATH.",
+            )
+            return
+
+        outfile = self.output_settings.output_path_for(first_path.parent)
+        if outfile.exists():
+            action, _ = confirm_existing_target(self, outfile, allow_apply_to_all=False)
+            if action != "overwrite":
+                self.status_label.setText(f"Skipped: {display_path(outfile)} already exists.")
+                return
+
+        try:
+            ok, stderr = build_joined_jpeg(
+                self.jpegtran_path, self.cjpeg_path, self.command_log,
+                first_path, second_path, self._direction(), self._bg_color, outfile,
+            )
+        except JoinIncompatibleError as exc:
+            QMessageBox.critical(self, "Can't join these images", str(exc))
+            return
+
+        if ok:
+            self.status_label.setText(f"Saved: {display_path(outfile)}.")
+        else:
+            self.status_label.setText(f"FAILED: {stderr}")
+
+
+# --------------------------------------------------------------------------
 # Log tab
 # --------------------------------------------------------------------------
 
@@ -1444,6 +2166,7 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(RotateTab(jpegtran_path, command_log, session_state), "Batch transform")
         tabs.addTab(CropTab(jpegtran_path, command_log, session_state), "Crop / Rotate")
+        tabs.addTab(JoinTab(jpegtran_path, command_log, session_state), "Join")
         tabs.addTab(LogTab(command_log), "Log")
 
         self.setCentralWidget(tabs)

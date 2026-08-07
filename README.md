@@ -31,7 +31,7 @@ dependencies (`PyQt6`, `piexif`) declared inline in `app.py` on first run.
 
 ## Usage
 
-The app has three tabs.
+The app has four tabs.
 
 ### Batch transform
 
@@ -85,6 +85,35 @@ The app has three tabs.
 - Click **Save image**. If the image was rotated but nothing is
   selected, Save still works — it just applies the rotation to the whole
   image, so this tab doubles as a single-image lossless rotator.
+
+### Join
+
+![](screenshots/join.png)
+
+- Drop two JPEG files onto the drop zone (or onto the preview below it) — the
+  first becomes the left/top image, the second the right/bottom; dropping
+  more only keeps the most recent two.
+- **Direction** picks side-by-side or stacked; the swap button next to it
+  exchanges which image is first/second (and flips the arrow icon to match).
+- **Background** picks the fill color used for any gap between the two
+  images (see below).
+- The preview uses the same floating-toolbar viewer style as Crop / Rotate
+  (zoom in/out/1:1), with both images scaled to their true relative sizes so
+  a size mismatch is visible before joining — it's an approximation for
+  quick sanity-checking, not pixel-accurate to the real output.
+- **Output settings**: a file name (defaults to `<first>_<second>.jpg`) and
+  the same source-folder-vs-chosen-folder choice as the other tabs.
+- Click **Join images**. This is done losslessly: a synthetic solid-color
+  canvas is generated at the right size, then `jpegtran` drops each source
+  image onto it byte-for-byte unchanged — the only pixels ever re-encoded
+  are the background fill, never the two photos. Because `jpegtran` can only
+  place an image at an offset aligned to its chroma-subsampling grid, the
+  seam between the two images may show a thin sliver (up to 15px) of the
+  background color rather than butting exactly flush — that's inherent to
+  staying fully lossless, not a bug.
+- If the two images use different chroma subsampling, they can't be
+  losslessly joined; the app shows an error explaining why rather than
+  silently re-encoding either photo.
 
 ### Log
 

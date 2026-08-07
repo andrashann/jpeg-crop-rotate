@@ -36,6 +36,14 @@ def jpegtran_path():
     return path
 
 
+@pytest.fixture(scope="session")
+def cjpeg_path():
+    path = app.find_cjpeg()
+    if path is None:
+        pytest.skip("cjpeg not found on PATH")
+    return path
+
+
 def write_test_image(path: Path, size: tuple[int, int] = (200, 130)) -> Path:
     """A small JPEG with a distinguishable gradient, so crop regions and
     rotations can be verified by content/dimensions, not just 'it ran'."""
